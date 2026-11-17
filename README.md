@@ -23,12 +23,21 @@ All state is in `.review/` in the target repo and nanocode's session journal, so
 - Kimi CLI logged in (`kimi login`); its login at `~/.kimi-code/credentials/kimi-code.json` signs reviewer requests
 - git, Python 3.9+
 
+## Install
+
+```bash
+uv tool install git+https://github.com/maximebrugel/claude-review
+# or: pipx install git+https://github.com/maximebrugel/claude-review
+```
+
+Or run the script directly: `./review_loop.py ...`
+
 ## Usage
 
 ```bash
-python3 review_loop.py -C path/to/repo "task description"   # start
-python3 review_loop.py -C path/to/repo                      # resume
-python3 review_loop.py --selftest
+claude-review -C path/to/repo "task description"   # start
+claude-review -C path/to/repo                      # resume
+claude-review --selftest
 ```
 
 ## Settings (environment variables)

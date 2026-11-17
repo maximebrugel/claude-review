@@ -375,8 +375,12 @@ def selftest():
     print("selftest ok")
 
 
-if __name__ == "__main__":
+def cli():
     try:
         selftest() if sys.argv[1:] == ["--selftest"] else main()
     except (RuntimeError, subprocess.CalledProcessError) as e:
-        sys.exit("review_loop: %s\nState is saved; rerun the same command to resume." % (getattr(e, "stderr", "") or e))
+        sys.exit("claude-review: %s\nState is saved; rerun the same command to resume." % (getattr(e, "stderr", "") or e))
+
+
+if __name__ == "__main__":
+    cli()

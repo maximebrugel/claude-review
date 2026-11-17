@@ -1,0 +1,15 @@
+[project]
+name = "claude-review"
+version = "0.1.0"
+description = "Continuous Claude development with async Kimi code review on nanocode"
+requires-python = ">=3.9"
+
+[project.scripts]
+claude-review = "review_loop:cli"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["review_loop"]
