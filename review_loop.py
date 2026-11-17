@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Continuous dev + review loop on NanoCode.
 
-  python3 review_loop.py -C path/to/repo "task description"   # start
-  python3 review_loop.py -C path/to/repo                      # resume after a crash / Ctrl-C
+  claude-review [-C path/to/repo]            # TUI: type the task, watch progress; rerun resumes
+  claude-review -C path/to/repo "task"       # same, task given up front (plain output when piped)
 
 Developer (Claude) works in the repo via `nc exec`. A background thread snapshots the
 working tree, and when enough has changed runs the reviewer (Kimi) on the incremental
 diff inside a read-only worktree. New findings are fed to the developer at its next
 turn. All state lives in .review/ and refs/review/*, so a rerun picks up where it left.
 """
-import argparse, hashlib, json, os, re, subprocess, sys, threading, time
+import argparse, collections, hashlib, json, os, re, subprocess, sys, threading, time
 
 E = os.environ.get
 NC = E("REVIEW_NC", "nanocode")
@@ -34,6 +34,19 @@ SEND = ("high", "medium")                     # severities fed back to the devel
 D, WT, LEDGER = ".review", ".review/wt", ".review/findings.json"
 REVIEW_LOCK, LEDGER_LOCK, STOP = threading.Lock(), threading.Lock(), threading.Event()
 PREV, LAST_T = None, time.time()
+LOG, KIDS = collections.deque(maxlen=200), set()
+STATE = {"dev": ("idle", 0), "rev": ("idle", 0)}
+TUI = False
+
+
+def say(msg):
+    LOG.append(time.strftime("%H:%M:%S ") + msg)
+    if not TUI:
+        print(msg, flush=True)
+
+
+def status(who, text, busy=False):
+    STATE[who] = (text, time.time() if busy else 0)
 
 DEV_INTRO = """{task}
 
@@ -104,15 +117,20 @@ def nc(name, cwd, model, think, prompt, resume=True, extra=(), env=None):
         open(mark, "w").write(prompt.splitlines()[0][:60])
     sid =open(path).read().strip() if resume and os.path.exists(path) else None
     cmd = [NC, "exec", "-C", cwd, "-m", model, "-t", think, *extra] + (["-r", sid] if sid else []) + [prompt]
-    p = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    KIDS.add(p)   # so quitting the TUI can stop running turns
+    try:
+        out, err = p.communicate()
+    finally:
+        KIDS.discard(p)
     with open(D + "/nc.log", "a") as f:
-        f.write("\n== %s %s\n%s" % (name, time.strftime("%F %T"), p.stderr))
-    ids = re.findall(r"^session (\S+)$", p.stderr, re.M)
+        f.write("\n== %s %s\n%s" % (name, time.strftime("%F %T"), err))
+    ids = re.findall(r"^session (\S+)$", err, re.M)
     if ids:
         open(path, "w").write(ids[-1])
     if p.returncode:
-        raise RuntimeError("%s turn failed: %s" % (name, (p.stderr.strip().splitlines() or ["?"])[-1]))
-    return p.stdout
+        raise RuntimeError("%s turn failed: %s" % (name, (err.strip().splitlines() or ["?"])[-1]))
+    return out
 
 
 TOKEN_LOCK = threading.Lock()
@@ -281,6 +299,8 @@ def review(force=False, final=False):
             known=known, diff=diff)
         # ponytail: incremental reviews share one resumed session, so its history grows with
         # every diff; rotate .review/rev.session if reviewer token cost starts to matter.
+        kind = "final" if final else "incremental"
+        status("rev", "%s review %s..%s, %d lines" % (kind, a[:7], snap[:7], n), busy=True)
         rev_token()   # refresh an expiring login now, not inside a request nanocode is waiting on
         reply = nc("final" if final else "rev", WT, REV_MODEL, REV_THINK, prompt,
                    resume=not final, extra=("--no-subagents",), env=REV_ENV)
@@ -289,8 +309,8 @@ def review(force=False, final=False):
             new = merge(led, parse(reply), snap)
             save(led)
         git("update-ref", "refs/review/reviewed", snap)   # only advance on success
-        print("[review] %s %s..%s: %d lines, %d new finding(s)" % (
-            "FINAL" if final else "incremental", a[:7], snap[:7], n, new), flush=True)
+        status("rev", "idle")
+        say("[review] %s %s..%s: %d lines, %d new finding(s)" % (kind, a[:7], snap[:7], n, new))
         return new
 
 
@@ -299,15 +319,22 @@ def watch():
         try:
             review()
         except Exception as e:   # keep developing; the forced review at TASK_DONE will surface it
-            print("[review] failed, retry in 5 min: %s" % e, flush=True)
+            status("rev", "failed, retrying in 5 min")
+            say("[review] failed, retry in 5 min: %s" % e)
             STOP.wait(300)
 
 
 # ---- developer -------------------------------------------------------------------------
 
+TURN = [0]
+
+
 def dev(prompt):
+    TURN[0] += 1
+    status("dev", "turn %d" % TURN[0], busy=True)
     reply = nc("dev", ".", DEV_MODEL, DEV_THINK, prompt)
-    print("[dev] " + (reply.strip().splitlines() or [""])[-1][:200], flush=True)
+    status("dev", "idle")
+    say("[dev] " + (reply.strip().splitlines() or [""])[-1][:200])
     return reply
 
 
@@ -320,19 +347,22 @@ def dev_with_findings(intro=""):
     return reply
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("task", nargs="?")
-    ap.add_argument("-C", dest="repo", default=".")
-    args = ap.parse_args()
-    os.chdir(args.repo)
+def setup(repo):
+    os.chdir(repo)
     git("rev-parse", "--git-dir")   # must be a git repo
     os.makedirs(D, exist_ok=True)
     open(D + "/.gitignore", "w").write("*\n")   # keeps .review out of snapshots and commits
     if os.path.exists(D + "/done"):
         sys.exit("already finished; delete .review/ to start over")
-    if args.task and not os.path.exists(D + "/task"):
-        open(D + "/task", "w").write(args.task)
+
+
+def save_task(task):
+    if task and not os.path.exists(D + "/task"):
+        open(D + "/task", "w").write(task)
+
+
+def run(task):
+    save_task(task)
     if not os.path.exists(D + "/task"):
         sys.exit("no task: pass one to start")
     if not ref("base"):
@@ -350,7 +380,7 @@ def main():
             if not pending():
                 break
     else:
-        print("[loop] developer turn cap reached, going to final review")
+        say("[loop] developer turn cap reached, going to final review")
     STOP.set()
 
     for r in range(FINAL_ROUNDS):       # round 0: whole change, fresh session; then only the fixes
@@ -360,8 +390,121 @@ def main():
         dev_with_findings()
     led = load()
     open(D + "/done", "w").write(time.strftime("%F %T\n"))
-    print("[loop] finished: %d finding(s), %d sent to developer. Ledger: %s/%s" % (
+    status("dev", "finished")
+    status("rev", "finished")
+    say("[loop] finished: %d finding(s), %d sent to developer. Ledger: %s/%s" % (
         len(led), sum(f["status"] == "sent" for f in led), os.getcwd(), LEDGER))
+
+
+# ---- TUI (stdlib curses) ---------------------------------------------------------------
+
+def ask(s):
+    """Task entry screen. Enter starts, Esc quits; a pasted multi-line task keeps its newlines."""
+    import curses, textwrap
+    text = ""
+    while True:
+        H, W = s.getmaxyx()
+        s.erase()
+        s.addnstr(0, 0, "claude-review  " + os.getcwd(), W - 1, curses.A_BOLD)
+        s.addnstr(2, 0, "What should Claude do? Enter to start, Esc to quit.", W - 1, curses.A_DIM)
+        lines = [l for p in ("> " + text).split("\n")
+                 for l in (textwrap.wrap(p, W - 1, drop_whitespace=False) or [""])][-(H - 5):]
+        for i, l in enumerate(lines):
+            s.addnstr(4 + i, 0, l, W - 1)
+        s.move(4 + len(lines) - 1, min(len(lines[-1]), W - 1))
+        s.refresh()
+        k = s.get_wch()
+        if k in ("\n", "\r", curses.KEY_ENTER):
+            s.timeout(0)                 # more input already waiting = a paste, not a keypress
+            try:
+                nxt = s.get_wch()
+            except curses.error:
+                nxt = None
+            s.timeout(-1)
+            if nxt is not None:
+                text += "\n"
+                curses.unget_wch(nxt)
+            elif text.strip():
+                return text.strip()
+        elif k == "\x1b":
+            return None
+        elif k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            text = text[:-1]
+        elif isinstance(k, str) and k.isprintable():
+            text += k
+
+
+def screen(s, worker):
+    import curses
+    curses.curs_set(0)
+    s.timeout(500)
+    curses.use_default_colors()
+    for i, c in enumerate((curses.COLOR_RED, curses.COLOR_YELLOW), 1):
+        curses.init_pair(i, c, -1)
+    sev = {"high": curses.color_pair(1) | curses.A_BOLD, "medium": curses.color_pair(2), "low": curses.A_DIM}
+    task = " ".join(open(D + "/task").read().split())
+    while True:
+        H, W = s.getmaxyx()
+        s.erase()
+        rows = []
+        rows += [("claude-review  " + os.getcwd(), curses.A_BOLD),
+                 ("developer %s/%s · reviewer %s/%s" % (DEV_MODEL, DEV_THINK, REV_MODEL, REV_THINK), curses.A_DIM),
+                 ("Task: " + task, 0), ("", 0)]
+        for who, label in (("dev", "Developer"), ("rev", "Reviewer ")):
+            text, t = STATE[who]
+            rows.append(("%s  %s%s" % (label, text, "  %d:%02d" % divmod(int(time.time() - t), 60) if t else ""),
+                         curses.A_BOLD if t else 0))
+        led = load()
+        count = collections.Counter(f["status"] for f in led)
+        rows += [("", 0), ("Findings  %d total · %d to send · %d sent · %d low (logged only)" % (
+            len(led), count["new"], count["sent"], count["logged"]), curses.A_BOLD)]
+        room = max(1, (H - len(rows) - 4) // 2)
+        rows += [("  %-6s %-6s %s:%s  %s" % (f["severity"], f["status"], f["file"], f.get("line", "?"), f["title"]),
+                  sev[f["severity"]]) for f in led[::-1][:room]]
+        rows += [("", 0), ("Log", curses.A_BOLD)]
+        rows += [(l, 0) for l in list(LOG)[-max(0, H - 1 - len(rows)):]]
+        for y, (text, attr) in enumerate(rows[:H - 1]):
+            s.addnstr(y, 0, text, W - 1, attr)
+        foot = "q quit · progress is saved, rerun to resume" if worker.is_alive() else "stopped · q to exit"
+        s.addnstr(H - 1, 0, foot, W - 1, curses.A_REVERSE)
+        s.refresh()
+        if s.getch() in (ord("q"), ord("Q")):
+            return
+
+
+def tui(task):
+    import curses, locale
+    global TUI
+    TUI = True
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    if not task and not os.path.exists(D + "/task"):
+        task = curses.wrapper(ask)
+        if not task:
+            return
+    save_task(task)
+    err = []
+
+    def work():
+        try:
+            run(task)
+        except Exception as e:
+            err.append("%s" % (getattr(e, "stderr", "") or e))
+            status("dev", "stopped")
+            say("error: " + err[-1])
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    try:
+        curses.wrapper(screen, worker)
+    except KeyboardInterrupt:
+        pass
+    if worker.is_alive():
+        for p in list(KIDS):
+            p.terminate()   # nanocode journals the turn; a rerun resumes it
+        sys.exit("stopped; rerun claude-review in %s to resume" % os.getcwd())
+    print("\n".join(list(LOG)[-5:]))
+    if err:
+        sys.exit("claude-review: %s\nState is saved; rerun the same command to resume." % err[-1])
 
 
 def selftest():
@@ -376,8 +519,17 @@ def selftest():
 
 
 def cli():
+    if sys.argv[1:] == ["--selftest"]:
+        return selftest()
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("task", nargs="?")
+    ap.add_argument("-C", dest="repo", default=".")
+    args = ap.parse_args()
     try:
-        selftest() if sys.argv[1:] == ["--selftest"] else main()
+        setup(args.repo)
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return tui(args.task)
+        run(args.task)
     except (RuntimeError, subprocess.CalledProcessError) as e:
         sys.exit("claude-review: %s\nState is saved; rerun the same command to resume." % (getattr(e, "stderr", "") or e))
 
