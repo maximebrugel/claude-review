@@ -35,12 +35,12 @@ Or run the script directly: `./review_loop.py ...`
 ## Usage
 
 ```bash
-claude-review -C path/to/repo                      # opens the TUI: type the task, Enter to start
+claude-review -C path/to/repo                      # asks for the task, Enter to start
 claude-review -C path/to/repo "task description"   # skip the prompt
 claude-review --selftest
 ```
 
-The TUI shows what the developer and reviewer are doing, the findings ledger and a log. `q` quits at any time; rerun the same command to resume. When output is piped, it prints plain log lines instead.
+Like Claude Code, it prints a scrolling transcript in your terminal: each agent's reasoning, tool calls and replies, the findings Kimi reports and when they are sent to Claude, with a live status line at the bottom. Ctrl-C stops at any time; rerun the same command to resume. When output is piped, the same transcript is printed without colors or status line.
 
 `.review/wt` is read-only on purpose; to start over, run `chmod -R u+w .review && rm -rf .review`.
 
